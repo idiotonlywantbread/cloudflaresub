@@ -6,12 +6,12 @@ const warningBox = document.getElementById('warningBox');
 const previewBody = document.getElementById('previewBody');
 
 const preferredIps = document.getElementById('preferredIps');
-const preferredToken = document.getElementById('preferredToken');
 const savePreferredBtn = document.getElementById('savePreferredBtn');
 const clearPreferredBtn = document.getElementById('clearPreferredBtn');
 const preferredStatus = document.getElementById('preferredStatus');
 const permanentPreferredIps = document.getElementById('permanentPreferredIps');
 const savePermanentPreferredBtn = document.getElementById('savePermanentPreferredBtn');
+const clearPermanentPreferredBtn = document.getElementById('clearPermanentPreferredBtn');
 const permanentPreferredStatus = document.getElementById('permanentPreferredStatus');
 
 const autoUrl = document.getElementById('autoUrl');
@@ -35,26 +35,17 @@ const demoIps = [
   '104.18.3.4:2053#US-Edge'
 ].join('\n');
 
-// Token 仅保存在当前标签页会话中，不写入 localStorage，也不硬编码到前端。
-const TOKEN_SESSION_KEY = 'preferred_api_token';
-preferredToken.value = sessionStorage.getItem(TOKEN_SESSION_KEY) || '';
-
-preferredToken.addEventListener('input', () => {
-  const token = preferredToken.value.trim();
-  if (token) sessionStorage.setItem(TOKEN_SESSION_KEY, token);
-  else sessionStorage.removeItem(TOKEN_SESSION_KEY);
-});
-
+// 登录成功后，Worker 通过 HttpOnly Cookie 携带 SUB_ACCESS_TOKEN；
+// 前端 JS 无法读取密钥，所有 API 请求由浏览器自动附带同源 Cookie。
 function getApiHeaders(json = false) {
-  const token = preferredToken.value.trim();
-  if (!token) throw new Error('请先填写现有 SUB_ACCESS_TOKEN。');
-  const headers = { Authorization: `Bearer ${token}` };
+  const headers = {};
   if (json) headers['content-type'] = 'application/json';
   return headers;
 }
 
 async function preferredApi(path, options = {}) {
   const response = await fetch(path, {
+    credentials: 'same-origin',
     ...options,
     headers: {
       ...getApiHeaders(Boolean(options.jsonBody)),
@@ -118,6 +109,24 @@ savePermanentPreferredBtn.addEventListener('click', async () => {
   }
 });
 
+clearPermanentPreferredBtn.addEventListener('click', async () => {
+  if (!window.confirm('确定清空第 3 项固定持久化列表中的全部 IP / 域名吗？此操作不可撤销，但不会影响第 2 项普通列表。')) return;
+
+  clearPermanentPreferredBtn.disabled = true;
+  const originalText = clearPermanentPreferredBtn.textContent;
+  clearPermanentPreferredBtn.textContent = '清空中...';
+  try {
+    const data = await preferredApi('/api/permanent-preferred/clear', { method: 'POST' });
+    permanentPreferredIps.value = '';
+    setPermanentPreferredStatus(`固定列表已清空，共删除 ${data.cleared} 条；第 2 项普通列表不受影响。`);
+  } catch (error) {
+    setPermanentPreferredStatus(error.message, true);
+  } finally {
+    clearPermanentPreferredBtn.disabled = false;
+    clearPermanentPreferredBtn.textContent = originalText;
+  }
+});
+
 async function loadPreferredEndpoints(showMessage = false) {
   try {
     const data = await preferredApi('/api/preferred', { method: 'GET' });
@@ -178,10 +187,6 @@ clearPreferredBtn.addEventListener('click', async () => {
   }
 });
 
-preferredToken.addEventListener('change', () => {
-  loadPreferredEndpoints(true);
-  loadPermanentPreferredEndpoints(true);
-});
 
 fillDemoBtn.addEventListener('click', () => {
   document.getElementById('nodeLinks').value = demoVmess;
@@ -209,6 +214,7 @@ form.addEventListener('submit', async (event) => {
   try {
     const response = await fetch('/api/generate', {
       method: 'POST',
+      credentials: 'same-origin',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
     });
@@ -323,11 +329,16 @@ function escapeHtml(value) {
     .replaceAll("'", '&#39;');
 }
 
-// 页面打开时尝试读取 KV；如尚未填写 Token，会提示先填写。
-if (preferredToken.value) {
-  loadPreferredEndpoints();
-  loadPermanentPreferredEndpoints();
-} else {
-  setPreferredStatus('填写 Token 后自动加载已保存地址');
-  setPermanentPreferredStatus('填写 Token 后自动加载固定列表');
-}
+// 页面只有在 Worker 登录验证通过后才会被发送到浏览器。
+loadPreferredEndpoints();
+loadPermanentPreferredEndpoints();
+
+const logoutBtn = document.getElementById('logoutBtn');
+logoutBtn?.addEventListener('click', async () => {
+  logoutBtn.disabled = true;
+  try {
+    await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
+  } finally {
+    location.replace('/');
+  }
+});
