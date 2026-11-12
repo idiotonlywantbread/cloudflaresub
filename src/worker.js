@@ -12,7 +12,7 @@ function json(data, status = 200) {
       'content-type': 'application/json; charset=utf-8',
       'access-control-allow-origin': '*',
       'access-control-allow-methods': 'GET,POST,OPTIONS',
-      'access-control-allow-headers': 'content-type',
+      'access-control-allow-headers': 'content-type, authorization',
     },
   });
 }
@@ -42,22 +42,142 @@ function escapeYaml(str = '') {
     .replace(/\n/g, ' ');
 }
 
+function isValidIPv4(value) {
+  const parts = value.split('.');
+  return parts.length === 4 && parts.every((part) =>
+    /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255
+  );
+}
+
+function isValidDomain(value) {
+  if (!value || value.length > 253 || value.includes('..')) return false;
+  const domain = value.endsWith('.') ? value.slice(0, -1) : value;
+  if (!domain) return false;
+  return domain.split('.').every((label) =>
+    label.length >= 1 &&
+    label.length <= 63 &&
+    /^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/.test(label)
+  );
+}
+
 function parsePreferredEndpoints(input) {
-  return String(input || '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const [raw, remark = ''] = line.split('#');
-      const value = raw.trim();
-      const hashRemark = remark.trim();
-      const match = value.match(/^(.*?)(?::(\d+))?$/);
-      return {
-        server: match?.[1] || value,
-        port: match?.[2] ? Number(match[2]) : undefined,
-        remark: hashRemark,
-      };
+  const valid = [];
+  const invalid = [];
+
+  for (const originalLine of String(input || '').split(/\r?\n/)) {
+    const line = originalLine.trim();
+    if (!line) continue;
+
+    const hashIndex = line.indexOf('#');
+    const rawValue = (hashIndex >= 0 ? line.slice(0, hashIndex) : line).trim();
+    const remark = hashIndex >= 0 ? line.slice(hashIndex + 1).trim() : '';
+
+    let server = rawValue;
+    let port;
+
+    // 本功能按 IPv4 / 域名格式解析；不把 IPv6 的冒号误判为端口分隔符。
+    const colonIndex = rawValue.lastIndexOf(':');
+    if (colonIndex > 0 && rawValue.indexOf(':') === colonIndex) {
+      const possiblePort = rawValue.slice(colonIndex + 1);
+      if (/^\d+$/.test(possiblePort)) {
+        server = rawValue.slice(0, colonIndex).trim();
+        port = Number(possiblePort);
+      } else {
+        invalid.push({ line: originalLine, reason: '端口必须是 1-65535 的数字' });
+        continue;
+      }
+    } else if (rawValue.includes(':')) {
+      invalid.push({ line: originalLine, reason: '暂不支持 IPv6 或包含多个冒号的地址' });
+      continue;
+    }
+
+    if (port !== undefined && (port < 1 || port > 65535)) {
+      invalid.push({ line: originalLine, reason: '端口范围必须是 1-65535' });
+      continue;
+    }
+
+    const isIp = isValidIPv4(server);
+    const isDomain = isValidDomain(server);
+    if (!isIp && !isDomain) {
+      invalid.push({ line: originalLine, reason: '不是有效的 IPv4 或域名' });
+      continue;
+    }
+
+    valid.push({
+      server: server.toLowerCase(),
+      port,
+      remark,
     });
+  }
+
+  return { valid, invalid };
+}
+
+function endpointDedupKey(endpoint) {
+  return `${endpoint.server.toLowerCase()}:${endpoint.port || ''}`;
+}
+
+function mergePreferredEndpoints(existing, incoming) {
+  const result = [];
+  const seen = new Set();
+
+  for (const endpoint of [...existing, ...incoming]) {
+    const key = endpointDedupKey(endpoint);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(endpoint);
+  }
+
+  return result;
+}
+
+async function getStoredPreferredEndpoints(env) {
+  const raw = await env.SUB_STORE.get('preferred:endpoints');
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+// 固定持久化列表使用独立 KV Key；本 Worker 不提供删除/清空接口。
+async function getStoredPermanentPreferredEndpoints(env) {
+  const raw = await env.SUB_STORE.get('preferred:permanent:endpoints');
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function isPermanentPreferredEnabled(env) {
+  // 未设置时默认启用；设置为 false / 0 / no 可关闭固定列表参与订阅。
+  const value = String(env.ENABLE_PERMANENT_PREFERRED ?? 'true').trim().toLowerCase();
+  return !['false', '0', 'no', 'off', 'disabled'].includes(value);
+}
+
+function getRequestToken(request, url) {
+  const authorization = request.headers.get('authorization') || '';
+  const bearer = authorization.match(/^Bearer\s+(.+)$/i);
+  return bearer?.[1] || url.searchParams.get('token') || '';
+}
+
+function validateApiToken(request, url, env) {
+  const expected = env.SUB_ACCESS_TOKEN || '';
+  if (!expected) {
+    return { ok: false, response: json({ ok: false, error: '未配置 SUB_ACCESS_TOKEN' }, 503) };
+  }
+
+  const provided = getRequestToken(request, url);
+  if (!provided || provided !== expected) {
+    return { ok: false, response: json({ ok: false, error: 'Unauthorized: invalid token' }, 401) };
+  }
+
+  return { ok: true };
 }
 
 function parseVmess(link) {
@@ -423,10 +543,11 @@ async function sha256Hex(input) {
     .join('');
 }
 
-async function buildDedupHash(body) {
+async function buildDedupHash(body, preferredEndpoints = []) {
   const normalized = {
     nodeLinks: normalizeLines(body.nodeLinks || ''),
     preferredIps: normalizeLines(body.preferredIps || ''),
+    effectivePreferredEndpoints: preferredEndpoints.map((ep) => `${endpointDedupKey(ep)}#${ep.remark || ''}`).sort(),
     namePrefix: String(body.namePrefix || '').trim(),
     keepOriginalHost: body.keepOriginalHost !== false,
   };
@@ -442,10 +563,25 @@ async function handleGenerate(request, env, url) {
   }
 
   const baseNodes = parseRawLinks(body.nodeLinks || '');
-  const preferredEndpoints = parsePreferredEndpoints(body.preferredIps || '');
+  const parsedPreferred = parsePreferredEndpoints(body.preferredIps || '');
+  const normalStored = await getStoredPreferredEndpoints(env);
+  const permanentStored = isPermanentPreferredEnabled(env)
+    ? await getStoredPermanentPreferredEndpoints(env)
+    : [];
+  // 生成时合并：页面本次输入 + 普通 KV 列表（第 2 项）+ 固定 KV 列表（第 4 项），按地址去重。
+  const preferredEndpoints = mergePreferredEndpoints(
+    mergePreferredEndpoints(normalStored, parsedPreferred.valid),
+    permanentStored,
+  );
 
   if (!baseNodes.length) return json({ ok: false, error: '没有识别到可用节点' }, 400);
-  if (!preferredEndpoints.length) return json({ ok: false, error: '没有识别到可用优选地址' }, 400);
+  if (!preferredEndpoints.length) {
+    return json({
+      ok: false,
+      error: '第 2 项普通列表和第 4 项固定列表均没有可用地址，请先保存或上传优选地址',
+      invalid: parsedPreferred.invalid,
+    }, 400);
+  }
 
   const options = {
     namePrefix: body.namePrefix || '',
@@ -461,7 +597,7 @@ async function handleGenerate(request, env, url) {
     nodes,
   };
 
-  const dedupHash = await buildDedupHash(body);
+  const dedupHash = await buildDedupHash(body, preferredEndpoints);
   const dedupKey = `dedup:${dedupHash}`;
 
   let id = await env.SUB_STORE.get(dedupKey);
@@ -526,6 +662,145 @@ function validateAccessToken(url, env) {
   return { ok: true };
 }
 
+async function handlePreferredGet(request, env, url) {
+  const auth = validateApiToken(request, url, env);
+  if (!auth.ok) return auth.response;
+
+  const endpoints = await getStoredPreferredEndpoints(env);
+  const content = endpoints.map((ep) =>
+    `${ep.server}${ep.port ? `:${ep.port}` : ''}${ep.remark ? `#${ep.remark}` : ''}`
+  ).join('\n');
+
+  return json({
+    ok: true,
+    count: endpoints.length,
+    content,
+    endpoints,
+  });
+}
+
+async function handlePreferredAppend(request, env, url) {
+  const auth = validateApiToken(request, url, env);
+  if (!auth.ok) return auth.response;
+
+  let input = '';
+  const contentType = request.headers.get('content-type') || '';
+
+  if (contentType.includes('application/json')) {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ ok: false, error: '请求体不是合法 JSON' }, 400);
+    }
+    input = body.content ?? body.preferredIps ?? body.text ?? '';
+  } else {
+    input = await request.text();
+  }
+
+  const parsed = parsePreferredEndpoints(input);
+  if (!parsed.valid.length) {
+    return json({
+      ok: false,
+      error: '没有可保存的有效优选地址',
+      added: 0,
+      invalid: parsed.invalid,
+    }, 400);
+  }
+
+  const existing = await getStoredPreferredEndpoints(env);
+  const merged = mergePreferredEndpoints(existing, parsed.valid);
+  const added = merged.length - existing.length;
+
+  // 不设置 expirationTtl：优选地址长期保存在 KV，直到主动清空。
+  await env.SUB_STORE.put('preferred:endpoints', JSON.stringify(merged));
+
+  return json({
+    ok: true,
+    mode: 'append',
+    received: parsed.valid.length,
+    added,
+    duplicates: parsed.valid.length - added,
+    invalidCount: parsed.invalid.length,
+    total: merged.length,
+    invalid: parsed.invalid,
+  });
+}
+
+async function handlePermanentPreferredGet(request, env, url) {
+  const auth = validateApiToken(request, url, env);
+  if (!auth.ok) return auth.response;
+
+  const endpoints = await getStoredPermanentPreferredEndpoints(env);
+  const content = endpoints.map((ep) =>
+    `${ep.server}${ep.port ? `:${ep.port}` : ''}${ep.remark ? `#${ep.remark}` : ''}`
+  ).join('\n');
+
+  return json({
+    ok: true,
+    count: endpoints.length,
+    content,
+    enabled: isPermanentPreferredEnabled(env),
+    deletableByApi: false,
+  });
+}
+
+async function handlePermanentPreferredAppend(request, env, url) {
+  const auth = validateApiToken(request, url, env);
+  if (!auth.ok) return auth.response;
+
+  let input = '';
+  const contentType = request.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ ok: false, error: '请求体不是合法 JSON' }, 400);
+    }
+    input = body.content ?? body.preferredIps ?? body.text ?? '';
+  } else {
+    input = await request.text();
+  }
+
+  const parsed = parsePreferredEndpoints(input);
+  if (!parsed.valid.length) {
+    return json({ ok: false, error: '没有可追加到固定列表的有效地址', invalid: parsed.invalid }, 400);
+  }
+
+  const existing = await getStoredPermanentPreferredEndpoints(env);
+  const merged = mergePreferredEndpoints(existing, parsed.valid);
+  const added = merged.length - existing.length;
+  // 只允许追加，不提供清空、覆盖或删除 API；不设置 TTL。
+  await env.SUB_STORE.put('preferred:permanent:endpoints', JSON.stringify(merged));
+
+  return json({
+    ok: true,
+    mode: 'append-only',
+    received: parsed.valid.length,
+    added,
+    duplicates: parsed.valid.length - added,
+    invalidCount: parsed.invalid.length,
+    total: merged.length,
+    enabled: isPermanentPreferredEnabled(env),
+    invalid: parsed.invalid,
+  });
+}
+
+async function handlePreferredClear(request, env, url) {
+  const auth = validateApiToken(request, url, env);
+  if (!auth.ok) return auth.response;
+
+  const before = await getStoredPreferredEndpoints(env);
+  await env.SUB_STORE.delete('preferred:endpoints');
+
+  return json({
+    ok: true,
+    cleared: before.length,
+    total: 0,
+  });
+}
+
 async function handleSub(url, env) {
   const tokenCheck = validateAccessToken(url, env);
   if (!tokenCheck.ok) return tokenCheck.response;
@@ -562,13 +837,34 @@ export default {
         headers: {
           'access-control-allow-origin': '*',
           'access-control-allow-methods': 'GET,POST,OPTIONS',
-          'access-control-allow-headers': 'content-type',
+          'access-control-allow-headers': 'content-type, authorization',
         },
       });
     }
 
     if (request.method === 'POST' && url.pathname === '/api/generate') {
       return handleGenerate(request, env, url);
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/preferred') {
+      return handlePreferredGet(request, env, url);
+    }
+
+    if (request.method === 'POST' &&
+        (url.pathname === '/api/preferred/save' || url.pathname === '/api/preferred/upload')) {
+      return handlePreferredAppend(request, env, url);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/preferred/clear') {
+      return handlePreferredClear(request, env, url);
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/permanent-preferred') {
+      return handlePermanentPreferredGet(request, env, url);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/permanent-preferred/save') {
+      return handlePermanentPreferredAppend(request, env, url);
     }
 
     if (request.method === 'GET' && url.pathname.startsWith('/sub/')) {
