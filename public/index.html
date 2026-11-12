@@ -27,6 +27,7 @@
         <div class="hero-note">
           <strong>适合场景</strong>
           <p>3X-UI / Xray / VPS 自建节点 + 你自己找好的 Cloudflare 优选 IP。</p>
+          <button id="logoutBtn" type="button" class="secondary small" style="margin-top:10px;">退出登录</button>
         </div>
       </section>
 
@@ -65,19 +66,8 @@ cf.example.com:443#US-Edge"
               <span id="preferredStatus" class="hint" role="status" aria-live="polite" style="align-self:center;"></span>
             </div>
 
-            <div style="margin-top:10px;">
-              <label for="preferredToken">API Token（填写 Worker 的 SUB_ACCESS_TOKEN）</label>
-              <input
-                id="preferredToken"
-                type="password"
-                autocomplete="off"
-                placeholder="输入现有 SUB_ACCESS_TOKEN，仅保存在当前浏览器标签页"
-              />
-              <p class="hint">用于读取、保存和清空 KV 中的优选地址。不会写入网页源码；关闭标签页后需要重新输入。</p>
-            </div>
-
             <div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border, #ddd);">
-              <label for="permanentPreferredIps">3. 固定持久化 IP / 域名（只追加，不提供清空）</label>
+              <label for="permanentPreferredIps">3. 固定持久化 IP / 域名</label>
               <textarea
                 id="permanentPreferredIps"
                 rows="6"
@@ -86,9 +76,10 @@ cf.example.com:443#US-Edge"
 1.1.1.1
 固定域名.example.com:443#固定入口"
               ></textarea>
-              <p class="hint">独立保存在 KV 的固定列表。保存接口只允许追加和去重，不提供 API 清空或删除；生成订阅时会与第 2 项合并。</p>
+              <p class="hint">独立保存在 KV 的固定列表。支持追加、自动去重和主动清空；清空只影响本列表，不影响第 2 项普通列表。生成订阅时会与第 2 项合并。</p>
               <div class="preferred-toolbar" style="display:flex;flex-wrap:wrap;gap:8px;margin:12px 0;">
                 <button id="savePermanentPreferredBtn" type="button" class="secondary">追加到固定列表</button>
+                <button id="clearPermanentPreferredBtn" type="button" class="secondary">清空固定列表</button>
                 <span id="permanentPreferredStatus" class="hint" role="status" aria-live="polite" style="align-self:center;"></span>
               </div>
             </div>
