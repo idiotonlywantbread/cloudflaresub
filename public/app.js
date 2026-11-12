@@ -1,178 +1,876 @@
-const form = document.getElementById('generator-form');
-const submitBtn = document.getElementById('submitBtn');
-const fillDemoBtn = document.getElementById('fillDemoBtn');
-const resultSection = document.getElementById('resultSection');
-const warningBox = document.getElementById('warningBox');
-const previewBody = document.getElementById('previewBody');
+// Cloudflare Worker: KV short link subscription + access token protection
+// Requires:
+// - KV namespace binding: SUB_STORE
+// - Secret/Variable: SUB_ACCESS_TOKEN
+// Optional:
+// - Secret/Variable: SUB_LINK_SECRET (legacy long-token compatibility)
 
-const autoUrl = document.getElementById('autoUrl');
-const rawUrl = document.getElementById('rawUrl');
-const clashUrl = document.getElementById('clashUrl');
-const surgeUrl = document.getElementById('surgeUrl');
-const emptyState = document.getElementById('emptyState');
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'access-control-allow-origin': '*',
+      'access-control-allow-methods': 'GET,POST,OPTIONS',
+      'access-control-allow-headers': 'content-type, authorization',
+    },
+  });
+}
 
-const qrModal = document.getElementById('qrModal');
-const qrCanvas = document.getElementById('qrCanvas');
-const qrText = document.getElementById('qrText');
-const closeQrModal = document.getElementById('closeQrModal');
+function text(body, status = 200, contentType = 'text/plain; charset=utf-8') {
+  return new Response(body, {
+    status,
+    headers: {
+      'content-type': contentType,
+      'access-control-allow-origin': '*',
+    },
+  });
+}
 
-const demoVmess = [
-  'vmess://ewogICJ2IjogIjIiLAogICJwcyI6ICJkZW1vLXdzLXRscyIsCiAgImFkZCI6ICJlZGdlLmV4YW1wbGUuY29tIiwKICAicG9ydCI6ICI0NDMiLAogICJpZCI6ICIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLAogICJzY3kiOiAiYXV0byIsCiAgIm5ldCI6ICJ3cyIsCiAgInRscyI6ICJ0bHMiLAogICJwYXRoIjogIi93cyIsCiAgImhvc3QiOiAiZWRnZS5leGFtcGxlLmNvbSIsCiAgInNuaSI6ICJlZGdlLmV4YW1wbGUuY29tIiwKICAiZnAiOiAiY2hyb21lIiwKICAiYWxwbiI6ICJoMixodHRwLzEuMSIKfQ=='
-].join('\n');
+function b64EncodeUtf8(str) {
+  return btoa(unescape(encodeURIComponent(str)));
+}
 
-const demoIps = [
-  '104.16.1.2#HK-01',
-  '104.17.2.3#HK-02',
-  '104.18.3.4:2053#US-Edge'
-].join('\n');
+function b64DecodeUtf8(str) {
+  return decodeURIComponent(escape(atob(str)));
+}
 
-fillDemoBtn.addEventListener('click', () => {
-  document.getElementById('nodeLinks').value = demoVmess;
-  document.getElementById('preferredIps').value = demoIps;
-  document.getElementById('namePrefix').value = 'CF';
-  document.getElementById('keepOriginalHost').checked = true;
-});
+function escapeYaml(str = '') {
+  return String(str)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, ' ');
+}
 
-form.addEventListener('submit', async (event) => {
-  event.preventDefault();
-  warningBox.classList.add('hidden');
-  previewBody.innerHTML = '';
+function isValidIPv4(value) {
+  const parts = value.split('.');
+  return parts.length === 4 && parts.every((part) =>
+    /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255
+  );
+}
 
-  const payload = {
-    nodeLinks: document.getElementById('nodeLinks').value,
-    preferredIps: document.getElementById('preferredIps').value,
-    namePrefix: document.getElementById('namePrefix').value,
-    keepOriginalHost: document.getElementById('keepOriginalHost').checked,
-  };
+function isValidDomain(value) {
+  if (!value || value.length > 253 || value.includes('..')) return false;
+  const domain = value.endsWith('.') ? value.slice(0, -1) : value;
+  if (!domain) return false;
+  return domain.split('.').every((label) =>
+    label.length >= 1 &&
+    label.length <= 63 &&
+    /^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/.test(label)
+  );
+}
 
-  submitBtn.disabled = true;
-  submitBtn.textContent = '生成中...';
+function parsePreferredEndpoints(input) {
+  const valid = [];
+  const invalid = [];
 
-  try {
-    const response = await fetch('/api/generate', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify(payload),
+  for (const originalLine of String(input || '').split(/\r?\n/)) {
+    const line = originalLine.trim();
+    if (!line) continue;
+
+    const hashIndex = line.indexOf('#');
+    const rawValue = (hashIndex >= 0 ? line.slice(0, hashIndex) : line).trim();
+    const remark = hashIndex >= 0 ? line.slice(hashIndex + 1).trim() : '';
+
+    let server = rawValue;
+    let port;
+
+    // 本功能按 IPv4 / 域名格式解析；不把 IPv6 的冒号误判为端口分隔符。
+    const colonIndex = rawValue.lastIndexOf(':');
+    if (colonIndex > 0 && rawValue.indexOf(':') === colonIndex) {
+      const possiblePort = rawValue.slice(colonIndex + 1);
+      if (/^\d+$/.test(possiblePort)) {
+        server = rawValue.slice(0, colonIndex).trim();
+        port = Number(possiblePort);
+      } else {
+        invalid.push({ line: originalLine, reason: '端口必须是 1-65535 的数字' });
+        continue;
+      }
+    } else if (rawValue.includes(':')) {
+      invalid.push({ line: originalLine, reason: '暂不支持 IPv6 或包含多个冒号的地址' });
+      continue;
+    }
+
+    if (port !== undefined && (port < 1 || port > 65535)) {
+      invalid.push({ line: originalLine, reason: '端口范围必须是 1-65535' });
+      continue;
+    }
+
+    const isIp = isValidIPv4(server);
+    const isDomain = isValidDomain(server);
+    if (!isIp && !isDomain) {
+      invalid.push({ line: originalLine, reason: '不是有效的 IPv4 或域名' });
+      continue;
+    }
+
+    valid.push({
+      server: server.toLowerCase(),
+      port,
+      remark,
     });
-
-    const data = await response.json();
-    if (!response.ok || !data.ok) {
-      throw new Error(data.error || '生成失败');
-    }
-
-    autoUrl.value = data.urls.auto;
-    rawUrl.value = data.urls.raw;
-    document.getElementById('rocketUrl').value = data.urls.raw;
-    clashUrl.value = data.urls.clash;
-    surgeUrl.value = data.urls.surge;
-
-    emptyState.classList.add('hidden');
-
-    document.getElementById('statInputNodes').textContent = data.counts.inputNodes;
-    document.getElementById('statEndpoints').textContent = data.counts.preferredEndpoints;
-    document.getElementById('statOutputNodes').textContent = data.counts.outputNodes;
-
-    previewBody.innerHTML = data.preview
-      .map(
-        (item) => `
-          <tr>
-            <td>${escapeHtml(item.name)}</td>
-            <td>${escapeHtml(item.type)}</td>
-            <td>${escapeHtml(item.server)}</td>
-            <td>${escapeHtml(String(item.port))}</td>
-            <td>${escapeHtml(item.host || '-')}</td>
-            <td>${escapeHtml(item.sni || '-')}</td>
-          </tr>`,
-      )
-      .join('');
-
-    if (Array.isArray(data.warnings) && data.warnings.length) {
-      warningBox.textContent = data.warnings.join('\n');
-      warningBox.classList.remove('hidden');
-    }
-
-    resultSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  } catch (error) {
-    warningBox.textContent = error.message || '请求失败';
-    warningBox.classList.remove('hidden');
-  } finally {
-    submitBtn.disabled = false;
-    submitBtn.textContent = '生成订阅';
   }
-});
 
-document.addEventListener('click', async (event) => {
-  const copyButton = event.target.closest('[data-copy-target]');
-  if (copyButton) {
-    const input = document.getElementById(copyButton.dataset.copyTarget);
-    if (!input?.value) {
-      return;
+  return { valid, invalid };
+}
+
+function endpointDedupKey(endpoint) {
+  return `${endpoint.server.toLowerCase()}:${endpoint.port || ''}`;
+}
+
+function mergePreferredEndpoints(existing, incoming) {
+  const result = [];
+  const seen = new Set();
+
+  for (const endpoint of [...existing, ...incoming]) {
+    const key = endpointDedupKey(endpoint);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(endpoint);
+  }
+
+  return result;
+}
+
+async function getStoredPreferredEndpoints(env) {
+  const raw = await env.SUB_STORE.get('preferred:endpoints');
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+// 固定持久化列表使用独立 KV Key；本 Worker 不提供删除/清空接口。
+async function getStoredPermanentPreferredEndpoints(env) {
+  const raw = await env.SUB_STORE.get('preferred:permanent:endpoints');
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function isPermanentPreferredEnabled(env) {
+  // 未设置时默认启用；设置为 false / 0 / no 可关闭固定列表参与订阅。
+  const value = String(env.ENABLE_PERMANENT_PREFERRED ?? 'true').trim().toLowerCase();
+  return !['false', '0', 'no', 'off', 'disabled'].includes(value);
+}
+
+function getRequestToken(request, url) {
+  const authorization = request.headers.get('authorization') || '';
+  const bearer = authorization.match(/^Bearer\s+(.+)$/i);
+  return bearer?.[1] || url.searchParams.get('token') || '';
+}
+
+function validateApiToken(request, url, env) {
+  const expected = env.SUB_ACCESS_TOKEN || '';
+  if (!expected) {
+    return { ok: false, response: json({ ok: false, error: '未配置 SUB_ACCESS_TOKEN' }, 503) };
+  }
+
+  const provided = getRequestToken(request, url);
+  if (!provided || provided !== expected) {
+    return { ok: false, response: json({ ok: false, error: 'Unauthorized: invalid token' }, 401) };
+  }
+
+  return { ok: true };
+}
+
+function parseVmess(link) {
+  const raw = link.slice('vmess://'.length).trim();
+  const obj = JSON.parse(b64DecodeUtf8(raw));
+  return {
+    type: 'vmess',
+    name: obj.ps || 'vmess',
+    server: obj.add,
+    port: Number(obj.port || 443),
+    uuid: obj.id,
+    cipher: obj.scy || 'auto',
+    network: obj.net || 'ws',
+    tls: obj.tls === 'tls',
+    host: obj.host || '',
+    path: obj.path || '/',
+    sni: obj.sni || obj.host || '',
+    alpn: obj.alpn || '',
+    fp: obj.fp || '',
+  };
+}
+
+function parseUrlLike(link, type) {
+  const u = new URL(link);
+  return {
+    type,
+    name: decodeURIComponent(u.hash.replace(/^#/, '')) || type,
+    server: u.hostname,
+    port: Number(u.port || 443),
+    password: type === 'trojan' ? decodeURIComponent(u.username) : undefined,
+    uuid: type === 'vless' ? decodeURIComponent(u.username) : undefined,
+    network: u.searchParams.get('type') || 'tcp',
+    tls: (u.searchParams.get('security') || '').toLowerCase() === 'tls',
+    host: u.searchParams.get('host') || u.searchParams.get('sni') || '',
+    path: u.searchParams.get('path') || '/',
+    sni: u.searchParams.get('sni') || u.searchParams.get('host') || '',
+    fp: u.searchParams.get('fp') || '',
+    alpn: u.searchParams.get('alpn') || '',
+    flow: u.searchParams.get('flow') || '',
+  };
+}
+
+function parseRawLinks(input) {
+  const lines = String(input || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const result = [];
+  for (const line of lines) {
+    if (line.startsWith('vmess://')) {
+      result.push(parseVmess(line));
+      continue;
+    }
+    if (line.startsWith('vless://')) {
+      result.push(parseUrlLike(line, 'vless'));
+      continue;
+    }
+    if (line.startsWith('trojan://')) {
+      result.push(parseUrlLike(line, 'trojan'));
+      continue;
     }
     try {
-      await navigator.clipboard.writeText(input.value);
-      const originalText = copyButton.textContent;
-      copyButton.textContent = '已复制';
-      setTimeout(() => {
-        copyButton.textContent = originalText;
-      }, 1200);
-    } catch {
-      input.select();
-      document.execCommand('copy');
-    }
-    return;
+      const decoded = b64DecodeUtf8(line);
+      if (/^(vmess|vless|trojan):\/\//m.test(decoded)) {
+        result.push(...parseRawLinks(decoded));
+      }
+    } catch {}
   }
+  return result;
+}
 
-  const qrButton = event.target.closest('[data-qrcode-target]');
-  if (qrButton) {
-    warningBox.classList.add('hidden');
-
-    const input = document.getElementById(qrButton.dataset.qrcodeTarget);
-    if (!input?.value) {
-      warningBox.textContent = '请先生成订阅链接，再显示二维码。';
-      warningBox.classList.remove('hidden');
-      return;
+function buildNodes(baseNodes, preferredEndpoints, options = {}) {
+  const output = [];
+  const prefix = (options.namePrefix || '').trim();
+  let counter = 0;
+  for (const node of baseNodes) {
+    for (const ep of preferredEndpoints) {
+      counter += 1;
+      const nameParts = [];
+      if (node.name) nameParts.push(node.name);
+      if (prefix) nameParts.push(prefix);
+      if (ep.remark) nameParts.push(ep.remark);
+      else nameParts.push(String(counter));
+      output.push({
+        ...node,
+        name: nameParts.join(' | '),
+        server: ep.server,
+        port: ep.port || node.port,
+        host: options.keepOriginalHost ? node.host : '',
+        sni: options.keepOriginalHost ? node.sni : '',
+      });
     }
+  }
+  return output;
+}
 
-    if (!window.QRCode) {
-      warningBox.textContent = '二维码组件加载失败，请刷新页面后重试。';
-      warningBox.classList.remove('hidden');
-      return;
-    }
+function encodeVmess(node) {
+  const obj = {
+    v: '2',
+    ps: node.name,
+    add: node.server,
+    port: String(node.port),
+    id: node.uuid,
+    aid: '0',
+    scy: node.cipher || 'auto',
+    net: node.network || 'ws',
+    type: 'none',
+    host: node.host || '',
+    path: node.path || '/',
+    tls: node.tls ? 'tls' : '',
+    sni: node.sni || '',
+    alpn: node.alpn || '',
+    fp: node.fp || '',
+  };
+  return 'vmess://' + b64EncodeUtf8(JSON.stringify(obj));
+}
 
-    qrCanvas.innerHTML = '';
-    qrText.textContent = input.value;
-    qrModal.classList.remove('hidden');
-    qrModal.setAttribute('aria-hidden', 'false');
+function encodeVless(node) {
+  const url = new URL(`vless://${encodeURIComponent(node.uuid)}@${node.server}:${node.port}`);
+  url.searchParams.set('type', node.network || 'ws');
+  if (node.tls) url.searchParams.set('security', 'tls');
+  if (node.host) url.searchParams.set('host', node.host);
+  if (node.sni) url.searchParams.set('sni', node.sni);
+  if (node.path) url.searchParams.set('path', node.path);
+  if (node.alpn) url.searchParams.set('alpn', node.alpn);
+  if (node.fp) url.searchParams.set('fp', node.fp);
+  if (node.flow) url.searchParams.set('flow', node.flow);
+  url.hash = node.name;
+  return url.toString();
+}
 
-    new window.QRCode(qrCanvas, {
-      text: input.value,
-      width: 220,
-      height: 220,
-      correctLevel: window.QRCode.CorrectLevel.M,
+function encodeTrojan(node) {
+  const url = new URL(`trojan://${encodeURIComponent(node.password)}@${node.server}:${node.port}`);
+  if (node.network) url.searchParams.set('type', node.network);
+  if (node.tls) url.searchParams.set('security', 'tls');
+  if (node.host) url.searchParams.set('host', node.host);
+  if (node.sni) url.searchParams.set('sni', node.sni);
+  if (node.path) url.searchParams.set('path', node.path);
+  if (node.alpn) url.searchParams.set('alpn', node.alpn);
+  if (node.fp) url.searchParams.set('fp', node.fp);
+  url.hash = node.name;
+  return url.toString();
+}
+
+function renderRaw(nodes) {
+  const lines = nodes
+    .map((node) => {
+      if (node.type === 'vmess') return encodeVmess(node);
+      if (node.type === 'vless') return encodeVless(node);
+      if (node.type === 'trojan') return encodeTrojan(node);
+      return '';
+    })
+    .filter(Boolean);
+  return b64EncodeUtf8(lines.join('\n'));
+}
+
+function renderClash(nodes) {
+  const proxies = nodes
+    .map((node) => {
+      if (node.type === 'vmess') {
+        const lines = [
+          `  - name: "${escapeYaml(node.name)}"`,
+          `    type: vmess`,
+          `    server: ${node.server}`,
+          `    port: ${node.port}`,
+          `    uuid: ${node.uuid}`,
+          `    alterId: 0`,
+          `    cipher: ${node.cipher || 'auto'}`,
+          `    udp: true`,
+          `    tls: ${node.tls ? 'true' : 'false'}`,
+          `    network: ${node.network || 'ws'}`,
+        ];
+
+        if (node.sni) {
+          lines.push(`    servername: "${escapeYaml(node.sni)}"`);
+        }
+
+        if ((node.network || 'ws') === 'ws') {
+          lines.push(
+            `    ws-opts:`,
+            `      path: "${escapeYaml(node.path || '/')}"`,
+            `      headers:`,
+            `        Host: "${escapeYaml(node.host || node.sni || '')}"`
+          );
+        }
+
+        return lines.join('\n');
+      }
+
+      if (node.type === 'vless') {
+        const lines = [
+          `  - name: "${escapeYaml(node.name)}"`,
+          `    type: vless`,
+          `    server: ${node.server}`,
+          `    port: ${node.port}`,
+          `    uuid: ${node.uuid}`,
+          `    udp: true`,
+          `    tls: ${node.tls ? 'true' : 'false'}`,
+          `    network: ${node.network || 'ws'}`,
+        ];
+
+        if (node.sni) {
+          lines.push(`    servername: "${escapeYaml(node.sni)}"`);
+        }
+
+        if ((node.network || 'ws') === 'ws') {
+          lines.push(
+            `    ws-opts:`,
+            `      path: "${escapeYaml(node.path || '/')}"`,
+            `      headers:`,
+            `        Host: "${escapeYaml(node.host || node.sni || '')}"`
+          );
+        }
+
+        return lines.join('\n');
+      }
+
+      if (node.type === 'trojan') {
+        const lines = [
+          `  - name: "${escapeYaml(node.name)}"`,
+          `    type: trojan`,
+          `    server: ${node.server}`,
+          `    port: ${node.port}`,
+          `    password: "${escapeYaml(node.password || '')}"`,
+          `    udp: true`,
+        ];
+
+        if (node.sni) {
+          lines.push(`    sni: "${escapeYaml(node.sni)}"`);
+        }
+
+        if (node.tls !== false) {
+          lines.push(`    tls: true`);
+        }
+
+        if (node.network) {
+          lines.push(`    network: ${node.network}`);
+        }
+
+        if (node.network === 'ws') {
+          lines.push(
+            `    ws-opts:`,
+            `      path: "${escapeYaml(node.path || '/')}"`,
+            `      headers:`,
+            `        Host: "${escapeYaml(node.host || node.sni || '')}"`
+          );
+        }
+
+        return lines.join('\n');
+      }
+
+      return '';
+    })
+    .filter(Boolean);
+
+  const proxyNames = nodes.map(
+    (node) => `      - "${escapeYaml(node.name)}"`
+  );
+
+  const allGroupMembers = [
+    `      - "自动选择"`,
+    ...proxyNames,
+    `      - DIRECT`,
+  ];
+
+  const autoGroupMembers = proxyNames.length ? proxyNames : [`      - DIRECT`];
+
+  return [
+    `mixed-port: 7890`,
+    `allow-lan: false`,
+    `mode: rule`,
+    `log-level: info`,
+    `ipv6: true`,
+    ``,
+    `proxies:`,
+    ...(proxies.length ? proxies : []),
+    ``,
+    `proxy-groups:`,
+    `  - name: "自动选择"`,
+    `    type: url-test`,
+    `    url: "http://www.gstatic.com/generate_204"`,
+    `    interval: 300`,
+    `    tolerance: 50`,
+    `    proxies:`,
+    ...autoGroupMembers,
+    ``,
+    `  - name: "节点选择"`,
+    `    type: select`,
+    `    proxies:`,
+    ...allGroupMembers,
+    ``,
+    `rules:`,
+    `  - MATCH,节点选择`,
+  ].join('\n');
+}
+
+function renderSurge(nodes, baseUrl, accessToken) {
+  const proxies = nodes
+    .filter((node) => node.type === 'vmess' || node.type === 'trojan')
+    .map((node) => {
+      if (node.type === 'vmess') {
+        return `${node.name} = vmess, ${node.server}, ${node.port}, username=${node.uuid}, ws=true, ws-path=${node.path || '/'}, ws-headers=Host:${node.host || ''}, tls=${node.tls ? 'true' : 'false'}, sni=${node.sni || ''}`;
+      }
+      return `${node.name} = trojan, ${node.server}, ${node.port}, password=${node.password || ''}, sni=${node.sni || ''}`;
     });
-    return;
-  }
 
-  if (event.target.closest('[data-close-modal="true"]')) {
-    closeQrDialog();
-  }
-});
-
-closeQrModal.addEventListener('click', closeQrDialog);
-
-function closeQrDialog() {
-  qrModal.classList.add('hidden');
-  qrModal.setAttribute('aria-hidden', 'true');
-  qrCanvas.innerHTML = '';
+  return [
+    '[General]',
+    'skip-proxy = 127.0.0.1, localhost',
+    '',
+    '[Proxy]',
+    ...proxies,
+    '',
+    '[Proxy Group]',
+    'Proxy = select, ' +
+      nodes
+        .filter((n) => n.type === 'vmess' || n.type === 'trojan')
+        .map((n) => n.name)
+        .join(', '),
+    '',
+    '[Rule]',
+    'FINAL,Proxy',
+    '',
+    '; token-protected subscription',
+    `; ${baseUrl}?token=${accessToken}`,
+  ].join('\n');
 }
 
-function escapeHtml(value) {
+function createShortId(length = 10) {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+  const bytes = crypto.getRandomValues(new Uint8Array(length));
+  let out = '';
+  for (let i = 0; i < length; i++) {
+    out += chars[bytes[i] % chars.length];
+  }
+  return out;
+}
+
+async function createUniqueShortId(env, tries = 8) {
+  for (let i = 0; i < tries; i++) {
+    const id = createShortId(10);
+    const exists = await env.SUB_STORE.get(`sub:${id}`);
+    if (!exists) return id;
+  }
+  throw new Error('无法生成唯一短链接，请稍后再试');
+}
+
+function normalizeLines(value = '') {
   return String(value)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .sort()
+    .join('\n');
 }
+
+async function sha256Hex(input) {
+  const data = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return [...new Uint8Array(digest)]
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function buildDedupHash(body, preferredEndpoints = []) {
+  const normalized = {
+    nodeLinks: normalizeLines(body.nodeLinks || ''),
+    preferredIps: normalizeLines(body.preferredIps || ''),
+    effectivePreferredEndpoints: preferredEndpoints.map((ep) => `${endpointDedupKey(ep)}#${ep.remark || ''}`).sort(),
+    namePrefix: String(body.namePrefix || '').trim(),
+    keepOriginalHost: body.keepOriginalHost !== false,
+  };
+  return sha256Hex(JSON.stringify(normalized));
+}
+
+async function handleGenerate(request, env, url) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok: false, error: '请求体不是合法 JSON' }, 400);
+  }
+
+  const baseNodes = parseRawLinks(body.nodeLinks || '');
+  const parsedPreferred = parsePreferredEndpoints(body.preferredIps || '');
+  const normalStored = await getStoredPreferredEndpoints(env);
+  const permanentStored = isPermanentPreferredEnabled(env)
+    ? await getStoredPermanentPreferredEndpoints(env)
+    : [];
+  // 生成时合并：页面本次输入 + 普通 KV 列表（第 2 项）+ 固定 KV 列表（第 4 项），按地址去重。
+  const preferredEndpoints = mergePreferredEndpoints(
+    mergePreferredEndpoints(normalStored, parsedPreferred.valid),
+    permanentStored,
+  );
+
+  if (!baseNodes.length) return json({ ok: false, error: '没有识别到可用节点' }, 400);
+  if (!preferredEndpoints.length) {
+    return json({
+      ok: false,
+      error: '第 2 项普通列表和第 4 项固定列表均没有可用地址，请先保存或上传优选地址',
+      invalid: parsedPreferred.invalid,
+    }, 400);
+  }
+
+  const options = {
+    namePrefix: body.namePrefix || '',
+    keepOriginalHost: body.keepOriginalHost !== false,
+  };
+
+  const nodes = buildNodes(baseNodes, preferredEndpoints, options);
+
+  const payload = {
+    version: 1,
+    createdAt: new Date().toISOString(),
+    options,
+    nodes,
+  };
+
+  const dedupHash = await buildDedupHash(body, preferredEndpoints);
+  const dedupKey = `dedup:${dedupHash}`;
+
+  let id = await env.SUB_STORE.get(dedupKey);
+
+  if (!id) {
+    id = await createUniqueShortId(env);
+    const ttl = 60 * 60 * 24 * 7; // 7天
+
+    await env.SUB_STORE.put(`sub:${id}`, JSON.stringify(payload), {
+      expirationTtl: ttl,
+    });
+
+    await env.SUB_STORE.put(dedupKey, id, {
+      expirationTtl: ttl,
+    });
+  }
+
+  const origin = url.origin;
+  const accessToken = env.SUB_ACCESS_TOKEN || '';
+  const withToken = (target) =>
+    `${origin}/sub/${id}${
+      target
+        ? `?target=${target}&token=${encodeURIComponent(accessToken)}`
+        : `?token=${encodeURIComponent(accessToken)}`
+    }`;
+
+  return json({
+    ok: true,
+    storage: 'kv',
+    deduplicated: true,
+    shortId: id,
+    urls: {
+      auto: withToken(''),
+      raw: withToken('raw'),
+      clash: withToken('clash'),
+      surge: withToken('surge'),
+    },
+    counts: {
+      inputNodes: baseNodes.length,
+      preferredEndpoints: preferredEndpoints.length,
+      outputNodes: nodes.length,
+    },
+    preview: nodes.slice(0, 20).map((node) => ({
+      name: node.name,
+      type: node.type,
+      server: node.server,
+      port: node.port,
+      host: node.host || '',
+      sni: node.sni || '',
+    })),
+    warnings: accessToken ? [] : ['未检测到 SUB_ACCESS_TOKEN，订阅链接将没有第二层访问保护。'],
+  });
+}
+
+function validateAccessToken(url, env) {
+  const expected = env.SUB_ACCESS_TOKEN;
+  if (!expected) return { ok: true };
+  const provided = url.searchParams.get('token') || '';
+  if (!provided || provided !== expected) {
+    return { ok: false, response: text('Forbidden: invalid token', 403) };
+  }
+  return { ok: true };
+}
+
+async function handlePreferredGet(request, env, url) {
+  const auth = validateApiToken(request, url, env);
+  if (!auth.ok) return auth.response;
+
+  const endpoints = await getStoredPreferredEndpoints(env);
+  const content = endpoints.map((ep) =>
+    `${ep.server}${ep.port ? `:${ep.port}` : ''}${ep.remark ? `#${ep.remark}` : ''}`
+  ).join('\n');
+
+  return json({
+    ok: true,
+    count: endpoints.length,
+    content,
+    endpoints,
+  });
+}
+
+async function handlePreferredAppend(request, env, url) {
+  const auth = validateApiToken(request, url, env);
+  if (!auth.ok) return auth.response;
+
+  let input = '';
+  const contentType = request.headers.get('content-type') || '';
+
+  if (contentType.includes('application/json')) {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ ok: false, error: '请求体不是合法 JSON' }, 400);
+    }
+    input = body.content ?? body.preferredIps ?? body.text ?? '';
+  } else {
+    input = await request.text();
+  }
+
+  const parsed = parsePreferredEndpoints(input);
+  if (!parsed.valid.length) {
+    return json({
+      ok: false,
+      error: '没有可保存的有效优选地址',
+      added: 0,
+      invalid: parsed.invalid,
+    }, 400);
+  }
+
+  const existing = await getStoredPreferredEndpoints(env);
+  const merged = mergePreferredEndpoints(existing, parsed.valid);
+  const added = merged.length - existing.length;
+
+  // 不设置 expirationTtl：优选地址长期保存在 KV，直到主动清空。
+  await env.SUB_STORE.put('preferred:endpoints', JSON.stringify(merged));
+
+  return json({
+    ok: true,
+    mode: 'append',
+    received: parsed.valid.length,
+    added,
+    duplicates: parsed.valid.length - added,
+    invalidCount: parsed.invalid.length,
+    total: merged.length,
+    invalid: parsed.invalid,
+  });
+}
+
+async function handlePermanentPreferredGet(request, env, url) {
+  const auth = validateApiToken(request, url, env);
+  if (!auth.ok) return auth.response;
+
+  const endpoints = await getStoredPermanentPreferredEndpoints(env);
+  const content = endpoints.map((ep) =>
+    `${ep.server}${ep.port ? `:${ep.port}` : ''}${ep.remark ? `#${ep.remark}` : ''}`
+  ).join('\n');
+
+  return json({
+    ok: true,
+    count: endpoints.length,
+    content,
+    enabled: isPermanentPreferredEnabled(env),
+    deletableByApi: false,
+  });
+}
+
+async function handlePermanentPreferredAppend(request, env, url) {
+  const auth = validateApiToken(request, url, env);
+  if (!auth.ok) return auth.response;
+
+  let input = '';
+  const contentType = request.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ ok: false, error: '请求体不是合法 JSON' }, 400);
+    }
+    input = body.content ?? body.preferredIps ?? body.text ?? '';
+  } else {
+    input = await request.text();
+  }
+
+  const parsed = parsePreferredEndpoints(input);
+  if (!parsed.valid.length) {
+    return json({ ok: false, error: '没有可追加到固定列表的有效地址', invalid: parsed.invalid }, 400);
+  }
+
+  const existing = await getStoredPermanentPreferredEndpoints(env);
+  const merged = mergePreferredEndpoints(existing, parsed.valid);
+  const added = merged.length - existing.length;
+  // 只允许追加，不提供清空、覆盖或删除 API；不设置 TTL。
+  await env.SUB_STORE.put('preferred:permanent:endpoints', JSON.stringify(merged));
+
+  return json({
+    ok: true,
+    mode: 'append-only',
+    received: parsed.valid.length,
+    added,
+    duplicates: parsed.valid.length - added,
+    invalidCount: parsed.invalid.length,
+    total: merged.length,
+    enabled: isPermanentPreferredEnabled(env),
+    invalid: parsed.invalid,
+  });
+}
+
+async function handlePreferredClear(request, env, url) {
+  const auth = validateApiToken(request, url, env);
+  if (!auth.ok) return auth.response;
+
+  const before = await getStoredPreferredEndpoints(env);
+  await env.SUB_STORE.delete('preferred:endpoints');
+
+  return json({
+    ok: true,
+    cleared: before.length,
+    total: 0,
+  });
+}
+
+async function handleSub(url, env) {
+  const tokenCheck = validateAccessToken(url, env);
+  if (!tokenCheck.ok) return tokenCheck.response;
+
+  const id = url.pathname.split('/').pop();
+  if (!id) return text('missing id', 400);
+
+  const raw = await env.SUB_STORE.get(`sub:${id}`);
+  if (!raw) return text('not found', 404);
+
+  const record = JSON.parse(raw);
+  const nodes = record.nodes || [];
+  const target = (url.searchParams.get('target') || 'raw').toLowerCase();
+
+  if (target === 'clash') {
+    return text(renderClash(nodes), 200, 'text/yaml; charset=utf-8');
+  }
+  if (target === 'surge') {
+    return text(
+      renderSurge(nodes, url.origin + url.pathname, env.SUB_ACCESS_TOKEN || ''),
+      200,
+      'text/plain; charset=utf-8',
+    );
+  }
+  return text(renderRaw(nodes), 200, 'text/plain; charset=utf-8');
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'access-control-allow-origin': '*',
+          'access-control-allow-methods': 'GET,POST,OPTIONS',
+          'access-control-allow-headers': 'content-type, authorization',
+        },
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/generate') {
+      return handleGenerate(request, env, url);
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/preferred') {
+      return handlePreferredGet(request, env, url);
+    }
+
+    if (request.method === 'POST' &&
+        (url.pathname === '/api/preferred/save' || url.pathname === '/api/preferred/upload')) {
+      return handlePreferredAppend(request, env, url);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/preferred/clear') {
+      return handlePreferredClear(request, env, url);
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/permanent-preferred') {
+      return handlePermanentPreferredGet(request, env, url);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/permanent-preferred/save') {
+      return handlePermanentPreferredAppend(request, env, url);
+    }
+
+    if (request.method === 'GET' && url.pathname.startsWith('/sub/')) {
+      return handleSub(url, env);
+    }
+
+    return env.ASSETS.fetch(request);
+  },
+};
