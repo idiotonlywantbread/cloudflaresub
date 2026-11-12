@@ -336,9 +336,21 @@ loadPermanentPreferredEndpoints();
 const logoutBtn = document.getElementById('logoutBtn');
 logoutBtn?.addEventListener('click', async () => {
   logoutBtn.disabled = true;
+  logoutBtn.textContent = '正在退出...';
   try {
-    await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
+    const response = await fetch('/api/logout', {
+      method: 'POST',
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+    if (!response.ok) {
+      throw new Error(`退出请求失败（HTTP ${response.status}）`);
+    }
+  } catch (error) {
+    // 即使网络异常也跳回入口；服务端 Cookie 清除失败时，刷新后仍可能保持登录。
+    console.error('Logout failed:', error);
   } finally {
-    location.replace('/');
+    // 使用 replace 避免浏览器后退直接显示旧管理页；no-store 由 Worker 配置保证。
+    location.replace('/?logout=' + Date.now());
   }
 });
