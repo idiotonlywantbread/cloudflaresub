@@ -16,7 +16,6 @@
       <section class="hero card">
         <div>
           <p class="eyebrow">InfiCheesy &amp; YouTube &amp; GitHub</p>
-
           <h1 class="hero-title">
             <img src="/icons/auto.svg" alt="logo" class="hero-logo" />
             <span>优选IP订阅生成器</span>
@@ -55,11 +54,44 @@
 104.16.1.2#HK-01
 104.17.2.3:2053#HK-02
 cf.example.com:443#US-Edge"
-              required
             ></textarea>
             <p class="hint">
               支持 <code>IP</code>、<code>IP:端口</code>、<code>域名</code>、<code>域名:端口</code>，<code>#</code> 后面可写备注。
             </p>
+
+            <div class="preferred-toolbar" style="display:flex;flex-wrap:wrap;gap:8px;margin:12px 0;">
+              <button id="savePreferredBtn" type="button" class="secondary">保存优选地址</button>
+              <button id="clearPreferredBtn" type="button" class="secondary">清空优选地址</button>
+              <span id="preferredStatus" class="hint" role="status" aria-live="polite" style="align-self:center;"></span>
+            </div>
+
+            <div style="margin-top:10px;">
+              <label for="preferredToken">API Token（填写 Worker 的 SUB_ACCESS_TOKEN）</label>
+              <input
+                id="preferredToken"
+                type="password"
+                autocomplete="off"
+                placeholder="输入现有 SUB_ACCESS_TOKEN，仅保存在当前浏览器标签页"
+              />
+              <p class="hint">用于读取、保存和清空 KV 中的优选地址。不会写入网页源码；关闭标签页后需要重新输入。</p>
+            </div>
+
+            <div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border, #ddd);">
+              <label for="permanentPreferredIps">4. 固定持久化 IP / 域名（只追加，不提供清空）</label>
+              <textarea
+                id="permanentPreferredIps"
+                rows="6"
+                placeholder="固定保存的地址示例：
+固定域名.example.com
+1.1.1.1
+固定域名.example.com:443#固定入口"
+              ></textarea>
+              <p class="hint">独立保存在 KV 的固定列表。保存接口只允许追加和去重，不提供 API 清空或删除；生成订阅时会与第 2 项合并。</p>
+              <div class="preferred-toolbar" style="display:flex;flex-wrap:wrap;gap:8px;margin:12px 0;">
+                <button id="savePermanentPreferredBtn" type="button" class="secondary">追加到固定列表</button>
+                <span id="permanentPreferredStatus" class="hint" role="status" aria-live="polite" style="align-self:center;"></span>
+              </div>
+            </div>
           </div>
 
           <div class="grid two-col compact">
@@ -110,120 +142,36 @@ cf.example.com:443#US-Edge"
         </div>
 
         <div id="warningBox" class="warning hidden"></div>
-
         <div id="emptyState" class="empty-state">
           还没有生成订阅。请先填写节点链接和优选 IP，然后点击“生成订阅”。
         </div>
 
         <div id="statsGrid" class="stats-grid">
-          <div class="stat-card">
-            <span class="stat-label">原始节点</span>
-            <strong id="statInputNodes">0</strong>
-          </div>
-          <div class="stat-card">
-            <span class="stat-label">优选地址</span>
-            <strong id="statEndpoints">0</strong>
-          </div>
-          <div class="stat-card">
-            <span class="stat-label">生成节点</span>
-            <strong id="statOutputNodes">0</strong>
-          </div>
+          <div class="stat-card"><span class="stat-label">原始节点</span><strong id="statInputNodes">0</strong></div>
+          <div class="stat-card"><span class="stat-label">优选地址</span><strong id="statEndpoints">0</strong></div>
+          <div class="stat-card"><span class="stat-label">生成节点</span><strong id="statOutputNodes">0</strong></div>
         </div>
 
         <div class="sub-grid">
           <article class="sub-card">
-            <div class="sub-card-head">
-              <div class="client-meta">
-                <div class="client-icon">
-                  <img src="/icons/auto.svg" alt="自动识别" />
-                </div>
-                <div>
-                  <h3>自动识别</h3>
-                  <p>适合支持自动识别的客户端</p>
-                </div>
-              </div>
-            </div>
-            <div class="sub-actions">
-              <input id="autoUrl" readonly />
-              <button data-copy-target="autoUrl" type="button" class="secondary small">复制</button>
-              <button data-qrcode-target="autoUrl" type="button" class="secondary small">二维码</button>
-            </div>
+            <div class="sub-card-head"><div class="client-meta"><div class="client-icon"><img src="/icons/auto.svg" alt="自动识别" /></div><div><h3>自动识别</h3><p>适合支持自动识别的客户端</p></div></div></div>
+            <div class="sub-actions"><input id="autoUrl" readonly /><button data-copy-target="autoUrl" type="button" class="secondary small">复制</button><button data-qrcode-target="autoUrl" type="button" class="secondary small">二维码</button></div>
           </article>
-
           <article class="sub-card">
-            <div class="sub-card-head">
-              <div class="client-meta">
-                <div class="client-icon">
-                  <img src="/icons/v2rayn.svg" alt="V2rayN" />
-                </div>
-                <div>
-                  <h3>V2rayN</h3>
-                  <p>适用于 V2rayN / v2rayNG</p>
-                </div>
-              </div>
-            </div>
-            <div class="sub-actions">
-              <input id="rawUrl" readonly />
-              <button data-copy-target="rawUrl" type="button" class="secondary small">复制</button>
-              <button data-qrcode-target="rawUrl" type="button" class="secondary small">二维码</button>
-            </div>
+            <div class="sub-card-head"><div class="client-meta"><div class="client-icon"><img src="/icons/v2rayn.svg" alt="V2rayN" /></div><div><h3>V2rayN</h3><p>适用于 V2rayN / v2rayNG</p></div></div></div>
+            <div class="sub-actions"><input id="rawUrl" readonly /><button data-copy-target="rawUrl" type="button" class="secondary small">复制</button><button data-qrcode-target="rawUrl" type="button" class="secondary small">二维码</button></div>
           </article>
-
           <article class="sub-card">
-            <div class="sub-card-head">
-              <div class="client-meta">
-                <div class="client-icon">
-                  <img src="/icons/clash.svg">
-                </div>
-                <div>
-                  <h3>Clash</h3>
-                  <p>适用于 Clash / Mihomo / Clash Verge</p>
-                </div>
-              </div>
-            </div>
-            <div class="sub-actions">
-              <input id="clashUrl" readonly />
-              <button data-copy-target="clashUrl" type="button" class="secondary small">复制</button>
-              <button data-qrcode-target="clashUrl" type="button" class="secondary small">二维码</button>
-            </div>
+            <div class="sub-card-head"><div class="client-meta"><div class="client-icon"><img src="/icons/clash.svg" alt="Clash" /></div><div><h3>Clash</h3><p>适用于 Clash / Mihomo / Clash Verge</p></div></div></div>
+            <div class="sub-actions"><input id="clashUrl" readonly /><button data-copy-target="clashUrl" type="button" class="secondary small">复制</button><button data-qrcode-target="clashUrl" type="button" class="secondary small">二维码</button></div>
           </article>
-
           <article class="sub-card">
-            <div class="sub-card-head">
-              <div class="client-meta">
-                <div class="client-icon">
-                  <img src="/icons/shadowrocket.svg" alt="Shadowrocket" />
-                </div>
-                <div>
-                  <h3>Shadowrocket</h3>
-                  <p>适用于 iPhone / iPad 小火箭</p>
-                </div>
-              </div>
-            </div>
-            <div class="sub-actions">
-              <input id="rocketUrl" readonly />
-              <button data-copy-target="rocketUrl" type="button" class="secondary small">复制</button>
-              <button data-qrcode-target="rocketUrl" type="button" class="secondary small">二维码</button>
-            </div>
+            <div class="sub-card-head"><div class="client-meta"><div class="client-icon"><img src="/icons/shadowrocket.svg" alt="Shadowrocket" /></div><div><h3>Shadowrocket</h3><p>适用于 iPhone / iPad 小火箭</p></div></div></div>
+            <div class="sub-actions"><input id="rocketUrl" readonly /><button data-copy-target="rocketUrl" type="button" class="secondary small">复制</button><button data-qrcode-target="rocketUrl" type="button" class="secondary small">二维码</button></div>
           </article>
-
           <article class="sub-card sub-card-wide">
-            <div class="sub-card-head">
-              <div class="client-meta">
-                <div class="client-icon">
-                  <img src="/icons/surge.svg" alt="Surge" />
-                </div>
-                <div>
-                  <h3>Surge</h3>
-                  <p>适用于 Surge Profile 导入</p>
-                </div>
-              </div>
-            </div>
-            <div class="sub-actions">
-              <input id="surgeUrl" readonly />
-              <button data-copy-target="surgeUrl" type="button" class="secondary small">复制</button>
-              <button data-qrcode-target="surgeUrl" type="button" class="secondary small">二维码</button>
-            </div>
+            <div class="sub-card-head"><div class="client-meta"><div class="client-icon"><img src="/icons/surge.svg" alt="Surge" /></div><div><h3>Surge</h3><p>适用于 Surge Profile 导入</p></div></div></div>
+            <div class="sub-actions"><input id="surgeUrl" readonly /><button data-copy-target="surgeUrl" type="button" class="secondary small">复制</button><button data-qrcode-target="surgeUrl" type="button" class="secondary small">二维码</button></div>
             <p class="hint">当前 Surge 导出以 VMess / Trojan 为主；你的示例 VMess 节点适用。</p>
           </article>
         </div>
@@ -232,16 +180,7 @@ cf.example.com:443#US-Edge"
           <h3>预览前 20 个生成节点</h3>
           <div class="table-wrap">
             <table>
-              <thead>
-                <tr>
-                  <th>名称</th>
-                  <th>类型</th>
-                  <th>服务器</th>
-                  <th>端口</th>
-                  <th>Host</th>
-                  <th>SNI</th>
-                </tr>
-              </thead>
+              <thead><tr><th>名称</th><th>类型</th><th>服务器</th><th>端口</th><th>Host</th><th>SNI</th></tr></thead>
               <tbody id="previewBody"></tbody>
             </table>
           </div>
@@ -252,20 +191,11 @@ cf.example.com:443#US-Edge"
     <div id="qrModal" class="modal hidden" aria-hidden="true">
       <div class="modal-backdrop" data-close-modal="true"></div>
       <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="qrTitle">
-        <div class="modal-head">
-          <div>
-            <p class="eyebrow">二维码导入</p>
-            <h3 id="qrTitle">订阅二维码</h3>
-          </div>
-          <button id="closeQrModal" type="button" class="secondary small">关闭</button>
-        </div>
-        <div class="modal-body">
-          <div id="qrCanvas" class="qr-box"></div>
-          <p id="qrText" class="hint qr-text"></p>
-        </div>
+        <div class="modal-head"><div><p class="eyebrow">二维码导入</p><h3 id="qrTitle">订阅二维码</h3></div><button id="closeQrModal" type="button" class="secondary small">关闭</button></div>
+        <div class="modal-body"><div id="qrCanvas" class="qr-box"></div><p id="qrText" class="hint qr-text"></p></div>
       </div>
     </div>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script> 
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
     <script type="module" src="/app.js"></script>
   </body>
 </html>
