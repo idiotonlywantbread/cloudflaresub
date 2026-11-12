@@ -60,61 +60,97 @@ function isValidDomain(value) {
   );
 }
 
+function isValidIPv6(value) {
+  if (!value || value.includes('%')) return false;
+  try {
+    const parsed = new URL(`http://[${value}]/`);
+    return parsed.hostname.startsWith('[') && parsed.hostname.endsWith(']');
+  } catch {
+    return false;
+  }
+}
+
+function stripIPv6Brackets(value) {
+  return String(value || '').replace(/^\[|\]$/g, '');
+}
+
+function formatPreferredEndpoint(endpoint) {
+  const server = String(endpoint.server || '');
+  const address = isValidIPv6(server) ? `[${server}]` : server;
+  return `${address}${endpoint.port ? `:${endpoint.port}` : ''}${endpoint.remark ? `#${endpoint.remark}` : ''}`;
+}
+
 function parsePreferredEndpoints(input) {
   const valid = [];
   const invalid = [];
 
   for (const originalLine of String(input || '').split(/\r?\n/)) {
     const line = originalLine.trim();
-    if (!line) continue;
+    if (!line || line.startsWith('#')) continue;
 
     const hashIndex = line.indexOf('#');
     const rawValue = (hashIndex >= 0 ? line.slice(0, hashIndex) : line).trim();
     const remark = hashIndex >= 0 ? line.slice(hashIndex + 1).trim() : '';
-
     let server = rawValue;
     let port;
 
-    // 本功能按 IPv4 / 域名格式解析；不把 IPv6 的冒号误判为端口分隔符。
-    const colonIndex = rawValue.lastIndexOf(':');
-    if (colonIndex > 0 && rawValue.indexOf(':') === colonIndex) {
-      const possiblePort = rawValue.slice(colonIndex + 1);
-      if (/^\d+$/.test(possiblePort)) {
-        server = rawValue.slice(0, colonIndex).trim();
-        port = Number(possiblePort);
-      } else {
-        invalid.push({ line: originalLine, reason: '端口必须是 1-65535 的数字' });
+    // IPv6 必须写成 [IPv6]:端口；内部保存时去掉方括号。
+    if (rawValue.startsWith('[')) {
+      const closeIndex = rawValue.indexOf(']');
+      if (closeIndex < 0) {
+        invalid.push({ line: originalLine, reason: 'IPv6 缺少结束方括号 ]' });
         continue;
       }
-    } else if (rawValue.includes(':')) {
-      invalid.push({ line: originalLine, reason: '暂不支持 IPv6 或包含多个冒号的地址' });
-      continue;
+      server = stripIPv6Brackets(rawValue.slice(0, closeIndex + 1));
+      const suffix = rawValue.slice(closeIndex + 1).trim();
+      if (suffix) {
+        if (!/^:\d+$/.test(suffix)) {
+          invalid.push({ line: originalLine, reason: 'IPv6 端口格式错误，应为 [IPv6]:443' });
+          continue;
+        }
+        port = Number(suffix.slice(1));
+      }
+      if (!isValidIPv6(server)) {
+        invalid.push({ line: originalLine, reason: '不是有效的 IPv6 地址' });
+        continue;
+      }
+    } else {
+      const colonIndex = rawValue.lastIndexOf(':');
+      if (colonIndex > 0 && rawValue.indexOf(':') === colonIndex) {
+        const possiblePort = rawValue.slice(colonIndex + 1);
+        if (!/^\d+$/.test(possiblePort)) {
+          invalid.push({ line: originalLine, reason: '端口必须是 1-65535 的数字' });
+          continue;
+        }
+        server = rawValue.slice(0, colonIndex).trim();
+        port = Number(possiblePort);
+      } else if (rawValue.includes(':')) {
+        invalid.push({ line: originalLine, reason: 'IPv6 必须使用 [IPv6]:端口 格式' });
+        continue;
+      }
     }
 
-    if (port !== undefined && (port < 1 || port > 65535)) {
+    if (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535)) {
       invalid.push({ line: originalLine, reason: '端口范围必须是 1-65535' });
       continue;
     }
 
     const isIp = isValidIPv4(server);
     const isDomain = isValidDomain(server);
-    if (!isIp && !isDomain) {
-      invalid.push({ line: originalLine, reason: '不是有效的 IPv4 或域名' });
+    const isIPv6 = isValidIPv6(server);
+    if (!isIp && !isDomain && !isIPv6) {
+      invalid.push({ line: originalLine, reason: '不是有效的 IPv4、IPv6 或域名' });
       continue;
     }
 
-    valid.push({
-      server: server.toLowerCase(),
-      port,
-      remark,
-    });
+    valid.push({ server: server.toLowerCase(), port, remark });
   }
 
   return { valid, invalid };
 }
 
 function endpointDedupKey(endpoint) {
-  return `${endpoint.server.toLowerCase()}:${endpoint.port || ''}`;
+  return `${endpoint.server.toLowerCase()}|${endpoint.port || ''}`;
 }
 
 function mergePreferredEndpoints(existing, incoming) {
@@ -261,7 +297,7 @@ function parseUrlLike(link, type) {
   return {
     type,
     name: decodeURIComponent(u.hash.replace(/^#/, '')) || type,
-    server: u.hostname,
+    server: stripIPv6Brackets(u.hostname),
     port: Number(u.port || 443),
     password: type === 'trojan' ? decodeURIComponent(u.username) : undefined,
     uuid: type === 'vless' ? decodeURIComponent(u.username) : undefined,
@@ -353,7 +389,8 @@ function encodeVmess(node) {
 }
 
 function encodeVless(node) {
-  const url = new URL(`vless://${encodeURIComponent(node.uuid)}@${node.server}:${node.port}`);
+  const authorityHost = isValidIPv6(node.server) ? `[${node.server}]` : node.server;
+  const url = new URL(`vless://${encodeURIComponent(node.uuid)}@${authorityHost}:${node.port}`);
   url.searchParams.set('type', node.network || 'ws');
   if (node.tls) url.searchParams.set('security', 'tls');
   if (node.host) url.searchParams.set('host', node.host);
@@ -367,7 +404,8 @@ function encodeVless(node) {
 }
 
 function encodeTrojan(node) {
-  const url = new URL(`trojan://${encodeURIComponent(node.password)}@${node.server}:${node.port}`);
+  const authorityHost = isValidIPv6(node.server) ? `[${node.server}]` : node.server;
+  const url = new URL(`trojan://${encodeURIComponent(node.password)}@${authorityHost}:${node.port}`);
   if (node.network) url.searchParams.set('type', node.network);
   if (node.tls) url.searchParams.set('security', 'tls');
   if (node.host) url.searchParams.set('host', node.host);
@@ -398,7 +436,7 @@ function renderClash(nodes) {
         const lines = [
           `  - name: "${escapeYaml(node.name)}"`,
           `    type: vmess`,
-          `    server: ${node.server}`,
+          `    server: "${escapeYaml(node.server)}"`,
           `    port: ${node.port}`,
           `    uuid: ${node.uuid}`,
           `    alterId: 0`,
@@ -428,7 +466,7 @@ function renderClash(nodes) {
         const lines = [
           `  - name: "${escapeYaml(node.name)}"`,
           `    type: vless`,
-          `    server: ${node.server}`,
+          `    server: "${escapeYaml(node.server)}"`,
           `    port: ${node.port}`,
           `    uuid: ${node.uuid}`,
           `    udp: true`,
@@ -456,7 +494,7 @@ function renderClash(nodes) {
         const lines = [
           `  - name: "${escapeYaml(node.name)}"`,
           `    type: trojan`,
-          `    server: ${node.server}`,
+          `    server: "${escapeYaml(node.server)}"`,
           `    port: ${node.port}`,
           `    password: "${escapeYaml(node.password || '')}"`,
           `    udp: true`,
@@ -736,7 +774,7 @@ async function handlePreferredGet(request, env, url) {
 
   const endpoints = await getStoredPreferredEndpoints(env);
   const content = endpoints.map((ep) =>
-    `${ep.server}${ep.port ? `:${ep.port}` : ''}${ep.remark ? `#${ep.remark}` : ''}`
+    formatPreferredEndpoint(ep)
   ).join('\n');
 
   return json({
@@ -801,7 +839,7 @@ async function handlePermanentPreferredGet(request, env, url) {
 
   const endpoints = await getStoredPermanentPreferredEndpoints(env);
   const content = endpoints.map((ep) =>
-    `${ep.server}${ep.port ? `:${ep.port}` : ''}${ep.remark ? `#${ep.remark}` : ''}`
+    formatPreferredEndpoint(ep)
   ).join('\n');
 
   return json({
