@@ -142,7 +142,7 @@ async function getStoredPreferredEndpoints(env) {
   }
 }
 
-// 固定持久化列表使用独立 KV Key；本 Worker 不提供删除/清空接口。
+// 固定持久化列表使用独立 KV Key；通过独立清空接口管理，不影响普通列表。
 async function getStoredPermanentPreferredEndpoints(env) {
   const raw = await env.SUB_STORE.get('preferred:permanent:endpoints');
   if (!raw) return [];
@@ -160,10 +160,23 @@ function isPermanentPreferredEnabled(env) {
   return !['false', '0', 'no', 'off', 'disabled'].includes(value);
 }
 
-function getRequestToken(request, url) {
+function getCookie(request, name) {
+  const cookie = request.headers.get('cookie') || '';
+  for (const part of cookie.split(';')) {
+    const index = part.indexOf('=');
+    if (index < 0) continue;
+    if (part.slice(0, index).trim() === name) {
+      try { return decodeURIComponent(part.slice(index + 1).trim()); }
+      catch { return ''; }
+    }
+  }
+  return '';
+}
+
+function getRequestToken(request) {
   const authorization = request.headers.get('authorization') || '';
   const bearer = authorization.match(/^Bearer\s+(.+)$/i);
-  return bearer?.[1] || url.searchParams.get('token') || '';
+  return bearer?.[1] || getCookie(request, 'sub_auth') || '';
 }
 
 function validateApiToken(request, url, env) {
@@ -172,12 +185,54 @@ function validateApiToken(request, url, env) {
     return { ok: false, response: json({ ok: false, error: '未配置 SUB_ACCESS_TOKEN' }, 503) };
   }
 
-  const provided = getRequestToken(request, url);
+  const provided = getRequestToken(request);
   if (!provided || provided !== expected) {
     return { ok: false, response: json({ ok: false, error: 'Unauthorized: invalid token' }, 401) };
   }
 
   return { ok: true };
+}
+
+function isBrowserAuthenticated(request, env) {
+  const expected = env.SUB_ACCESS_TOKEN || '';
+  return Boolean(expected && getCookie(request, 'sub_auth') === expected);
+}
+
+function loginPage() {
+  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>个人订阅管理 - 身份验证</title><style>
+  *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b1220;color:#e5e7eb;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;padding:24px}.panel{width:min(420px,100%);padding:30px;border:1px solid #263247;border-radius:18px;background:#111c2e;box-shadow:0 20px 60px #0005}h1{font-size:23px;margin:0 0 8px}.muted{color:#9ca3af;font-size:14px;line-height:1.6}input{width:100%;margin:20px 0 12px;padding:14px;border:1px solid #37465e;border-radius:10px;background:#0b1220;color:#fff;font-size:16px}button{width:100%;padding:13px;border:0;border-radius:10px;background:#3b82f6;color:white;font-size:15px;font-weight:600;cursor:pointer}button:disabled{opacity:.6}.error{min-height:22px;color:#f87171;font-size:13px;margin-top:12px}
+  </style></head><body><main class="panel"><h1>个人订阅管理</h1><p class="muted">请输入访问密钥。验证通过后才会加载管理页面。</p><form id="login"><input id="key" type="password" autocomplete="current-password" placeholder="访问密钥" required autofocus><button id="go" type="submit">验证并进入</button><div id="error" class="error" role="status"></div></form></main><script>
+  const form=document.getElementById('login'),key=document.getElementById('key'),go=document.getElementById('go'),err=document.getElementById('error');
+  form.addEventListener('submit',async e=>{e.preventDefault();err.textContent='';go.disabled=true;go.textContent='验证中...';try{const r=await fetch('/api/auth',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:key.value})});const d=await r.json().catch(()=>({}));if(!r.ok||!d.ok)throw new Error(d.error||'密钥错误');location.replace('/');}catch(x){err.textContent=x.message||'验证失败';key.focus();key.select();}finally{go.disabled=false;go.textContent='验证并进入';}});
+  </script></body></html>`;
+  return new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
+}
+
+async function handleAuth(request, env) {
+  const expected = env.SUB_ACCESS_TOKEN || '';
+  if (!expected) return json({ ok: false, error: '服务端未配置 SUB_ACCESS_TOKEN' }, 503);
+  let body;
+  try { body = await request.json(); } catch { return json({ ok: false, error: '请求格式错误' }, 400); }
+  if (!body || typeof body.token !== 'string' || body.token !== expected) {
+    return json({ ok: false, error: '访问密钥错误' }, 401);
+  }
+  return new Response(JSON.stringify({ ok: true }), {
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      'set-cookie': `sub_auth=${encodeURIComponent(expected)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=604800`,
+    },
+  });
+}
+
+function handleLogout() {
+  return new Response(JSON.stringify({ ok: true }), {
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'set-cookie': 'sub_auth=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0',
+      'cache-control': 'no-store',
+    },
+  });
 }
 
 function parseVmess(link) {
@@ -555,6 +610,9 @@ async function buildDedupHash(body, preferredEndpoints = []) {
 }
 
 async function handleGenerate(request, env, url) {
+  const auth = validateApiToken(request, url, env);
+  if (!auth.ok) return auth.response;
+
   let body;
   try {
     body = await request.json();
@@ -568,7 +626,7 @@ async function handleGenerate(request, env, url) {
   const permanentStored = isPermanentPreferredEnabled(env)
     ? await getStoredPermanentPreferredEndpoints(env)
     : [];
-  // 生成时合并：页面本次输入 + 普通 KV 列表（第 2 项）+ 固定 KV 列表（第 4 项），按地址去重。
+  // 生成时合并：页面本次输入 + 普通 KV 列表（第 2 项）+ 固定 KV 列表（第 3 项），按地址去重。
   const preferredEndpoints = mergePreferredEndpoints(
     mergePreferredEndpoints(normalStored, parsedPreferred.valid),
     permanentStored,
@@ -578,7 +636,7 @@ async function handleGenerate(request, env, url) {
   if (!preferredEndpoints.length) {
     return json({
       ok: false,
-      error: '第 2 项普通列表和第 4 项固定列表均没有可用地址，请先保存或上传优选地址',
+      error: '第 2 项普通列表和第 3 项固定列表均没有可用地址，请先保存或上传优选地址',
       invalid: parsedPreferred.invalid,
     }, 400);
   }
@@ -597,22 +655,30 @@ async function handleGenerate(request, env, url) {
     nodes,
   };
 
-  const dedupHash = await buildDedupHash(body, preferredEndpoints);
-  const dedupKey = `dedup:${dedupHash}`;
+  // 配置 FIXED_SUB_ID 后，所有生成操作都覆盖同一个 KV 记录，短链接永久固定。
+  // 固定模式不设置 TTL，也不走内容哈希去重；更新配置即更新同一条订阅。
+  const configuredFixedId = String(env.FIXED_SUB_ID || '').trim();
+  let id;
+  let fixedLink = false;
 
-  let id = await env.SUB_STORE.get(dedupKey);
+  if (configuredFixedId) {
+    if (!/^[A-Za-z0-9_-]{3,64}$/.test(configuredFixedId)) {
+      return json({ ok: false, error: 'FIXED_SUB_ID 格式无效，只允许 3-64 位字母、数字、下划线和连字符' }, 503);
+    }
+    id = configuredFixedId;
+    fixedLink = true;
+    await env.SUB_STORE.put(`sub:${id}`, JSON.stringify(payload));
+  } else {
+    const dedupHash = await buildDedupHash(body, preferredEndpoints);
+    const dedupKey = `dedup:${dedupHash}`;
+    id = await env.SUB_STORE.get(dedupKey);
 
-  if (!id) {
-    id = await createUniqueShortId(env);
-    const ttl = 60 * 60 * 24 * 7; // 7天
-
-    await env.SUB_STORE.put(`sub:${id}`, JSON.stringify(payload), {
-      expirationTtl: ttl,
-    });
-
-    await env.SUB_STORE.put(dedupKey, id, {
-      expirationTtl: ttl,
-    });
+    if (!id) {
+      id = await createUniqueShortId(env);
+      const ttl = 60 * 60 * 24 * 7; // 普通模式保留 7 天
+      await env.SUB_STORE.put(`sub:${id}`, JSON.stringify(payload), { expirationTtl: ttl });
+      await env.SUB_STORE.put(dedupKey, id, { expirationTtl: ttl });
+    }
   }
 
   const origin = url.origin;
@@ -627,7 +693,8 @@ async function handleGenerate(request, env, url) {
   return json({
     ok: true,
     storage: 'kv',
-    deduplicated: true,
+    deduplicated: !fixedLink,
+    fixedLink,
     shortId: id,
     urls: {
       auto: withToken(''),
@@ -648,13 +715,13 @@ async function handleGenerate(request, env, url) {
       host: node.host || '',
       sni: node.sni || '',
     })),
-    warnings: accessToken ? [] : ['未检测到 SUB_ACCESS_TOKEN，订阅链接将没有第二层访问保护。'],
+    warnings: fixedLink ? ['固定短链接模式：后续生成会覆盖同一链接对应的订阅内容。'] : ['未设置 FIXED_SUB_ID：当前使用临时短链接，7 天后过期。'],
   });
 }
 
 function validateAccessToken(url, env) {
-  const expected = env.SUB_ACCESS_TOKEN;
-  if (!expected) return { ok: true };
+  const expected = env.SUB_ACCESS_TOKEN || '';
+  if (!expected) return { ok: false, response: text('Service unavailable: SUB_ACCESS_TOKEN is not configured', 503) };
   const provided = url.searchParams.get('token') || '';
   if (!provided || provided !== expected) {
     return { ok: false, response: text('Forbidden: invalid token', 403) };
@@ -771,7 +838,7 @@ async function handlePermanentPreferredAppend(request, env, url) {
   const existing = await getStoredPermanentPreferredEndpoints(env);
   const merged = mergePreferredEndpoints(existing, parsed.valid);
   const added = merged.length - existing.length;
-  // 只允许追加，不提供清空、覆盖或删除 API；不设置 TTL。
+  // 追加保存，不设置 TTL；清空由独立接口执行。
   await env.SUB_STORE.put('preferred:permanent:endpoints', JSON.stringify(merged));
 
   return json({
@@ -784,6 +851,20 @@ async function handlePermanentPreferredAppend(request, env, url) {
     total: merged.length,
     enabled: isPermanentPreferredEnabled(env),
     invalid: parsed.invalid,
+  });
+}
+
+async function handlePermanentPreferredClear(request, env, url) {
+  const auth = validateApiToken(request, url, env);
+  if (!auth.ok) return auth.response;
+
+  const before = await getStoredPermanentPreferredEndpoints(env);
+  await env.SUB_STORE.delete('preferred:permanent:endpoints');
+
+  return json({
+    ok: true,
+    cleared: before.length,
+    total: 0,
   });
 }
 
@@ -842,6 +923,15 @@ export default {
       });
     }
 
+    if (request.method === 'POST' && url.pathname === '/api/auth') {
+      return handleAuth(request, env);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/logout') {
+      if (!validateApiToken(request, url, env).ok) return json({ ok: false, error: 'Unauthorized' }, 401);
+      return handleLogout();
+    }
+
     if (request.method === 'POST' && url.pathname === '/api/generate') {
       return handleGenerate(request, env, url);
     }
@@ -867,10 +957,31 @@ export default {
       return handlePermanentPreferredAppend(request, env, url);
     }
 
+    if (request.method === 'POST' && url.pathname === '/api/permanent-preferred/clear') {
+      return handlePermanentPreferredClear(request, env, url);
+    }
+
     if (request.method === 'GET' && url.pathname.startsWith('/sub/')) {
       return handleSub(url, env);
     }
 
-    return env.ASSETS.fetch(request);
+    // API 仅允许同源浏览器请求；命令行客户端不带 Origin 时仍可用 Bearer Token。
+    const requestOrigin = request.headers.get('origin');
+    if (url.pathname.startsWith('/api/') && requestOrigin && requestOrigin !== url.origin) {
+      return json({ ok: false, error: 'Cross-origin API requests are not allowed' }, 403);
+    }
+
+    // 静态管理页面、JS、CSS、图标全部受登录 Cookie 保护。
+    if (isBrowserAuthenticated(request, env)) {
+      const assetResponse = await env.ASSETS.fetch(request);
+      const headers = new Headers(assetResponse.headers);
+      headers.set('cache-control', 'no-store');
+      return new Response(assetResponse.body, { status: assetResponse.status, statusText: assetResponse.statusText, headers });
+    }
+
+    if (url.pathname === '/' || url.pathname === '/index.html') {
+      return loginPage();
+    }
+    return text('Unauthorized', 401);
   },
 };
