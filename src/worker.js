@@ -225,6 +225,7 @@ async function handleAuth(request, env) {
   });
 }
 
+// 登出不要求先通过认证：即使 Cookie 已损坏/过期，也始终尝试清除浏览器中的会话 Cookie。
 function handleLogout() {
   return new Response(JSON.stringify({ ok: true }), {
     headers: {
@@ -928,7 +929,6 @@ export default {
     }
 
     if (request.method === 'POST' && url.pathname === '/api/logout') {
-      if (!validateApiToken(request, url, env).ok) return json({ ok: false, error: 'Unauthorized' }, 401);
       return handleLogout();
     }
 
