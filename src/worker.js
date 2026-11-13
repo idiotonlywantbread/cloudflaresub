@@ -61,23 +61,13 @@ function isValidDomain(value) {
 }
 
 function isValidIPv6(value) {
-  if (!value || value.includes('%')) return false;
-  try {
-    const parsed = new URL(`http://[${value}]/`);
-    return parsed.hostname.startsWith('[') && parsed.hostname.endsWith(']');
-  } catch {
-    return false;
-  }
-}
-
-function stripIPv6Brackets(value) {
-  return String(value || '').replace(/^\[|\]$/g, '');
-}
-
-function formatPreferredEndpoint(endpoint) {
-  const server = String(endpoint.server || '');
-  const address = isValidIPv6(server) ? `[${server}]` : server;
-  return `${address}${endpoint.port ? `:${endpoint.port}` : ''}${endpoint.remark ? `#${endpoint.remark}` : ''}`;
+  if (!value || value.includes('%') || !/^[0-9a-fA-F:]+$/.test(value)) return false;
+  if (value.includes(':::')) return false;
+  const double = value.indexOf('::');
+  if (double !== -1 && value.indexOf('::', double + 2) !== -1) return false;
+  const groups = value.split(':').filter(Boolean);
+  if (groups.some((group) => group.length > 4)) return false;
+  return double === -1 ? groups.length === 8 : groups.length < 8;
 }
 
 function parsePreferredEndpoints(input) {
@@ -86,30 +76,20 @@ function parsePreferredEndpoints(input) {
 
   for (const originalLine of String(input || '').split(/\r?\n/)) {
     const line = originalLine.trim();
-    if (!line || line.startsWith('#')) continue;
-
+    if (!line) continue;
     const hashIndex = line.indexOf('#');
     const rawValue = (hashIndex >= 0 ? line.slice(0, hashIndex) : line).trim();
     const remark = hashIndex >= 0 ? line.slice(hashIndex + 1).trim() : '';
     let server = rawValue;
     let port;
+    let isIPv6 = false;
 
-    // IPv6 必须写成 [IPv6]:端口；内部保存时去掉方括号。
-    if (rawValue.startsWith('[')) {
-      const closeIndex = rawValue.indexOf(']');
-      if (closeIndex < 0) {
-        invalid.push({ line: originalLine, reason: 'IPv6 缺少结束方括号 ]' });
-        continue;
-      }
-      server = stripIPv6Brackets(rawValue.slice(0, closeIndex + 1));
-      const suffix = rawValue.slice(closeIndex + 1).trim();
-      if (suffix) {
-        if (!/^:\d+$/.test(suffix)) {
-          invalid.push({ line: originalLine, reason: 'IPv6 端口格式错误，应为 [IPv6]:443' });
-          continue;
-        }
-        port = Number(suffix.slice(1));
-      }
+    // IPv6 使用 [地址]:端口，避免冒号被误认为端口分隔符。
+    const bracketedIPv6 = rawValue.match(/^\[([0-9a-fA-F:]+)\](?::(\d+))?$/);
+    if (bracketedIPv6) {
+      server = bracketedIPv6[1];
+      port = bracketedIPv6[2] === undefined ? undefined : Number(bracketedIPv6[2]);
+      isIPv6 = true;
       if (!isValidIPv6(server)) {
         invalid.push({ line: originalLine, reason: '不是有效的 IPv6 地址' });
         continue;
@@ -118,14 +98,15 @@ function parsePreferredEndpoints(input) {
       const colonIndex = rawValue.lastIndexOf(':');
       if (colonIndex > 0 && rawValue.indexOf(':') === colonIndex) {
         const possiblePort = rawValue.slice(colonIndex + 1);
-        if (!/^\d+$/.test(possiblePort)) {
+        if (/^\d+$/.test(possiblePort)) {
+          server = rawValue.slice(0, colonIndex).trim();
+          port = Number(possiblePort);
+        } else {
           invalid.push({ line: originalLine, reason: '端口必须是 1-65535 的数字' });
           continue;
         }
-        server = rawValue.slice(0, colonIndex).trim();
-        port = Number(possiblePort);
       } else if (rawValue.includes(':')) {
-        invalid.push({ line: originalLine, reason: 'IPv6 必须使用 [IPv6]:端口 格式' });
+        invalid.push({ line: originalLine, reason: 'IPv6 地址必须使用 [IPv6]:端口 格式' });
         continue;
       }
     }
@@ -134,23 +115,19 @@ function parsePreferredEndpoints(input) {
       invalid.push({ line: originalLine, reason: '端口范围必须是 1-65535' });
       continue;
     }
-
     const isIp = isValidIPv4(server);
     const isDomain = isValidDomain(server);
-    const isIPv6 = isValidIPv6(server);
-    if (!isIp && !isDomain && !isIPv6) {
+    if (!isIPv6 && !isIp && !isDomain) {
       invalid.push({ line: originalLine, reason: '不是有效的 IPv4、IPv6 或域名' });
       continue;
     }
-
     valid.push({ server: server.toLowerCase(), port, remark });
   }
-
   return { valid, invalid };
 }
 
 function endpointDedupKey(endpoint) {
-  return `${endpoint.server.toLowerCase()}|${endpoint.port || ''}`;
+  return `${endpoint.server.toLowerCase()}:${endpoint.port || ''}`;
 }
 
 function mergePreferredEndpoints(existing, incoming) {
@@ -297,7 +274,7 @@ function parseUrlLike(link, type) {
   return {
     type,
     name: decodeURIComponent(u.hash.replace(/^#/, '')) || type,
-    server: stripIPv6Brackets(u.hostname),
+    server: u.hostname,
     port: Number(u.port || 443),
     password: type === 'trojan' ? decodeURIComponent(u.username) : undefined,
     uuid: type === 'vless' ? decodeURIComponent(u.username) : undefined,
@@ -389,8 +366,7 @@ function encodeVmess(node) {
 }
 
 function encodeVless(node) {
-  const authorityHost = isValidIPv6(node.server) ? `[${node.server}]` : node.server;
-  const url = new URL(`vless://${encodeURIComponent(node.uuid)}@${authorityHost}:${node.port}`);
+  const url = new URL(`vless://${encodeURIComponent(node.uuid)}@${node.server}:${node.port}`);
   url.searchParams.set('type', node.network || 'ws');
   if (node.tls) url.searchParams.set('security', 'tls');
   if (node.host) url.searchParams.set('host', node.host);
@@ -404,8 +380,7 @@ function encodeVless(node) {
 }
 
 function encodeTrojan(node) {
-  const authorityHost = isValidIPv6(node.server) ? `[${node.server}]` : node.server;
-  const url = new URL(`trojan://${encodeURIComponent(node.password)}@${authorityHost}:${node.port}`);
+  const url = new URL(`trojan://${encodeURIComponent(node.password)}@${node.server}:${node.port}`);
   if (node.network) url.searchParams.set('type', node.network);
   if (node.tls) url.searchParams.set('security', 'tls');
   if (node.host) url.searchParams.set('host', node.host);
@@ -436,7 +411,7 @@ function renderClash(nodes) {
         const lines = [
           `  - name: "${escapeYaml(node.name)}"`,
           `    type: vmess`,
-          `    server: "${escapeYaml(node.server)}"`,
+          `    server: ${node.server}`,
           `    port: ${node.port}`,
           `    uuid: ${node.uuid}`,
           `    alterId: 0`,
@@ -466,7 +441,7 @@ function renderClash(nodes) {
         const lines = [
           `  - name: "${escapeYaml(node.name)}"`,
           `    type: vless`,
-          `    server: "${escapeYaml(node.server)}"`,
+          `    server: ${node.server}`,
           `    port: ${node.port}`,
           `    uuid: ${node.uuid}`,
           `    udp: true`,
@@ -494,7 +469,7 @@ function renderClash(nodes) {
         const lines = [
           `  - name: "${escapeYaml(node.name)}"`,
           `    type: trojan`,
-          `    server: "${escapeYaml(node.server)}"`,
+          `    server: ${node.server}`,
           `    port: ${node.port}`,
           `    password: "${escapeYaml(node.password || '')}"`,
           `    udp: true`,
@@ -773,9 +748,10 @@ async function handlePreferredGet(request, env, url) {
   if (!auth.ok) return auth.response;
 
   const endpoints = await getStoredPreferredEndpoints(env);
-  const content = endpoints.map((ep) =>
-    formatPreferredEndpoint(ep)
-  ).join('\n');
+  const content = endpoints.map((ep) => {
+    const host = ep.server.includes(':') ? `[${ep.server}]` : ep.server;
+    return `${host}${ep.port ? `:${ep.port}` : ''}${ep.remark ? `#${ep.remark}` : ''}`;
+  }).join('\n');
 
   return json({
     ok: true,
@@ -838,9 +814,10 @@ async function handlePermanentPreferredGet(request, env, url) {
   if (!auth.ok) return auth.response;
 
   const endpoints = await getStoredPermanentPreferredEndpoints(env);
-  const content = endpoints.map((ep) =>
-    formatPreferredEndpoint(ep)
-  ).join('\n');
+  const content = endpoints.map((ep) => {
+    const host = ep.server.includes(':') ? `[${ep.server}]` : ep.server;
+    return `${host}${ep.port ? `:${ep.port}` : ''}${ep.remark ? `#${ep.remark}` : ''}`;
+  }).join('\n');
 
   return json({
     ok: true,
@@ -890,6 +867,46 @@ async function handlePermanentPreferredAppend(request, env, url) {
     total: merged.length,
     enabled: isPermanentPreferredEnabled(env),
     invalid: parsed.invalid,
+  });
+}
+
+async function handlePermanentPreferredReplace(request, env, url) {
+  const auth = validateApiToken(request, url, env);
+  if (!auth.ok) return auth.response;
+
+  let input = '';
+  const contentType = request.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    let body;
+    try { body = await request.json(); }
+    catch { return json({ ok: false, error: '请求体不是合法 JSON' }, 400); }
+    input = body.content ?? body.preferredIps ?? body.text ?? '';
+  } else {
+    input = await request.text();
+  }
+
+  const parsed = parsePreferredEndpoints(input);
+  if (!parsed.valid.length || parsed.invalid.length) {
+    return json({
+      ok: false,
+      error: '替换内容为空或包含无效地址；原固定列表保持不变',
+      invalidCount: parsed.invalid.length,
+      invalid: parsed.invalid,
+    }, 400);
+  }
+
+  const unique = mergePreferredEndpoints([], parsed.valid);
+  // 单次 KV put 原子替换旧列表；不先 delete，避免失败时线上列表丢失。
+  await env.SUB_STORE.put('preferred:permanent:endpoints', JSON.stringify(unique));
+  return json({
+    ok: true,
+    mode: 'replace',
+    received: parsed.valid.length,
+    added: unique.length,
+    duplicates: parsed.valid.length - unique.length,
+    invalidCount: 0,
+    total: unique.length,
+    enabled: isPermanentPreferredEnabled(env),
   });
 }
 
@@ -993,6 +1010,10 @@ export default {
 
     if (request.method === 'POST' && url.pathname === '/api/permanent-preferred/save') {
       return handlePermanentPreferredAppend(request, env, url);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/permanent-preferred/replace') {
+      return handlePermanentPreferredReplace(request, env, url);
     }
 
     if (request.method === 'POST' && url.pathname === '/api/permanent-preferred/clear') {
